@@ -31,3 +31,7 @@ pub fn build(b: *std.Build) void {
 ```
 
 Of course, you can use simply download the repo (git subtree, or similar) and build it instead of using the package manager.
+
+## Future Work
+I'd love to have optionality for static allocation, however im not sure how to complete that at this moment and for my purposes, using a heap is OK for now. 
+If your hot path can not have mallocs, then this lib may not be for you.
