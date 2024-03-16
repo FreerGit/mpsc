@@ -1,7 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub const cache_line_length = std.atomic.cache_line;
+const cache_line_length = std.atomic.cache_line;
 
 pub fn Mpsc(comptime T: type) type {
     return struct {
