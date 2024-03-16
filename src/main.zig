@@ -32,11 +32,41 @@ pub fn Mpsc(comptime T: type) type {
             const old = @atomicRmw(?*Node, &self.back, .Xchg, src, .acq_rel) orelse &self.front;
             @atomicStore(?*Node, &old.next, src, .release);
         }
+
+        pub fn try_pop(self: *Mpsc(T)) !?*Node {
+            var first = @atomicLoad(?*Node, &self.front.next, .acquire) orelse return null;
+
+            if (@atomicLoad(?*Node, &first.next, .acquire)) |next| {
+                self.front.next = next;
+                assert(@atomicRmw(usize, &self.count, .Sub, 1, .monotonic) >= 1);
+                return first;
+            }
+
+            const last = @atomicLoad(?*Node, &self.back, .acquire) orelse &self.front;
+            if (first != last) return null;
+
+            self.front.next = null;
+
+            if (@cmpxchgStrong(?*Node, &self.back, last, &self.front, .acq_rel, .acquire) == null) {
+                assert(@atomicRmw(usize, &self.count, .Sub, 1, .monotonic) >= 1);
+                return first;
+            }
+
+            var maybe_next = @atomicLoad(?*Node, &first.next, .acquire);
+            while (maybe_next == null) : (try std.Thread.yield()) {
+                maybe_next = @atomicLoad(?*Node, &first.next, .acquire);
+            }
+
+            self.front.next = maybe_next;
+
+            assert(@atomicRmw(usize, &self.count, .Sub, 1, .monotonic) >= 1);
+            return first;
+        }
     };
 }
 
 test "Illustrate the size of Node" {
-    const x = struct {
+    const A = struct {
         a: i64,
         b: i64,
         c: i64,
@@ -48,8 +78,8 @@ test "Illustrate the size of Node" {
     try std.testing.expectEqual(@sizeOf(Mpsc(i32).Node), 16);
     try std.testing.expectEqual(@sizeOf(Mpsc(u8).Node), 16);
     try std.testing.expectEqual(@sizeOf(Mpsc(bool).Node), 16);
-    // A simple primitive type will be 8 bytes, giving a more complex type will produce larger Node size.
-    try std.testing.expectEqual(@sizeOf(Mpsc(x).Node), 32);
+    // Using a more complex type will produce larger Node size, again just be cognizant.
+    try std.testing.expectEqual(@sizeOf(Mpsc(A).Node), 32);
 }
 
 test "Illustrate the size of Mpsc" {
@@ -69,7 +99,7 @@ test "Trivial peek" {
     try std.testing.expect(queue.peek() == 0);
 }
 
-test "Trivial push" {
+test "Trivial push and pop" {
     var queue: Mpsc(u64) = .{};
     const allocator = std.testing.allocator;
 
@@ -79,5 +109,55 @@ test "Trivial push" {
         queue.try_push(node);
     }
 
-    try std.testing.expect(queue.peek() == 10);
+    for (0..10) |_| {
+        if (try queue.try_pop()) |node| {
+            allocator.destroy(node);
+        }
+    }
+
+    try std.testing.expectEqual(queue.peek(), 0);
+}
+
+test "push and pop 100_000 u64s with 10 producers" {
+    const NUM_ITEMS = 100_000;
+    const NUM_PRODUCERS = 10;
+
+    var queue: Mpsc(u64) = .{};
+    const allocator = std.testing.allocator;
+
+    const fns = struct {
+        fn runProducer(q: *Mpsc(u64)) !void {
+            for (0..NUM_ITEMS / NUM_PRODUCERS) |i| {
+                const node = try allocator.create(Mpsc(u64).Node);
+                node.* = .{ .value = @intCast(i) };
+                q.try_push(node);
+            }
+        }
+
+        fn runConsumer(q: *Mpsc(u64)) !void {
+            for (0..NUM_ITEMS) |_| {
+                while (true) {
+                    if (try q.try_pop()) |node| {
+                        allocator.destroy(node);
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    const consumer = try std.Thread.spawn(.{}, fns.runConsumer, .{&queue});
+
+    var producers: [NUM_PRODUCERS]std.Thread = undefined;
+
+    for (&producers) |*producer| {
+        producer.* = try std.Thread.spawn(.{}, fns.runProducer, .{&queue});
+    }
+
+    const begin = std.time.nanoTimestamp();
+    consumer.join();
+    for (producers) |producer| producer.join();
+    const end = std.time.nanoTimestamp();
+    std.debug.print("{d}\n", .{end - begin});
+    try std.testing.expect(queue.peek() == 0);
 }
